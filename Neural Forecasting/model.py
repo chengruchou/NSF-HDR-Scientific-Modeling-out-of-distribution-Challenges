@@ -154,16 +154,33 @@ class Model:
 
         self._is_loaded = False
 
+    def _load_state_dict(self, state):
+        # Accept plain state_dict or common checkpoint wrappers.
+        if isinstance(state, dict):
+            if "state_dict" in state:
+                state = state["state_dict"]
+            elif "model_state_dict" in state:
+                state = state["model_state_dict"]
+        self.model.load_state_dict(state, strict=True)
+
     def load(self):
         base = os.path.dirname(__file__)
         path = os.path.join(base, self.weight_file)
-        state = torch.load(path, map_location="cpu")
-        self.model.load_state_dict(state)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Expected weight file at {path}")
+
+        # weights_only is used when available (PyTorch>=2.0); falls back otherwise.
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state = torch.load(path, map_location="cpu")
+
+        self._load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
         self._is_loaded = True
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, X):
         """
         X: numpy array
