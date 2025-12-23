@@ -4,81 +4,97 @@ import torch
 import torch.nn as nn
 
 
-# -------------------------
-# STNDT-style model backbone
-# (3D input: (B,T,C) -> (B,T,C))
-# -------------------------
-class _AxialBlock(nn.Module):
+class FeatureGate(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(num_features),
+            nn.Linear(num_features, num_features),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.net(x)
+
+
+class GatedAxialBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, ffn_mult: int = 4):
         super().__init__()
         self.time_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.chan_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+
+        self.temporal_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.res_dropout = nn.Dropout(dropout)
 
         self.ln_t = nn.LayerNorm(d_model)
         self.ln_c = nn.LayerNorm(d_model)
         self.ln_f = nn.LayerNorm(d_model)
 
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_mult * d_model),
+            nn.Linear(d_model, ffn_mult * d_model * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(ffn_mult * d_model, d_model),
+            nn.Linear(ffn_mult * d_model * 2, d_model),
             nn.Dropout(dropout),
         )
 
+        self.gamma_t = nn.Parameter(torch.ones(1) * 0.5)
+        self.gamma_c = nn.Parameter(torch.ones(1) * 0.5)
+        self.gamma_f = nn.Parameter(torch.ones(1) * 0.5)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C, D)
         B, T, C, D = x.shape
 
-        # Time attention per channel
-        xt = x.permute(0, 2, 1, 3).contiguous().view(B * C, T, D)  # (B*C, T, D)
-        xt_ln = self.ln_t(xt)
-        attn_t, _ = self.time_attn(xt_ln, xt_ln, xt_ln, need_weights=False)
-        xt = xt + attn_t
-        xt = xt.view(B, C, T, D).permute(0, 2, 1, 3).contiguous()  # (B,T,C,D)
+        xt = x.permute(0, 2, 1, 3).contiguous().view(B * C, T, D)
+        xt_norm = self.ln_t(xt)
+        attn_t, _ = self.time_attn(xt_norm, xt_norm, xt_norm, need_weights=False)
 
-        # Channel attention per time
-        xc = xt.view(B * T, C, D)  # (B*T, C, D)
-        xc_ln = self.ln_c(xc)
-        attn_c, _ = self.chan_attn(xc_ln, xc_ln, xc_ln, need_weights=False)
-        xc = xc + attn_c
+        conv_out = self.temporal_conv(xt_norm.transpose(1, 2)).transpose(1, 2)
+        xt = xt + self.gamma_t * self.res_dropout(attn_t + conv_out)
+        xt = xt.view(B, C, T, D).permute(0, 2, 1, 3).contiguous()
+
+        xc = xt.view(B * T, C, D)
+        xc_norm = self.ln_c(xc)
+        attn_c, _ = self.chan_attn(xc_norm, xc_norm, xc_norm, need_weights=False)
+        xc = xc + self.gamma_c * self.res_dropout(attn_c)
         x2 = xc.view(B, T, C, D)
 
-        # FFN
         x3 = self.ln_f(x2)
-        x3 = x2 + self.ffn(x3)
+        x3 = x2 + self.gamma_f * self.ffn(x3)
         return x3
 
 
-class NFSTNDTModel(nn.Module):
-    """
-    Input:  (B, T=20, C)
-    Output: (B, T=20, C)
-    """
+class NFSTNDTModelV2(nn.Module):
     def __init__(
         self,
-        hidden_size: int = 256,
+        input_size: int = 96,
+        hidden_size: int = 1024,
         n_heads: int = 8,
         n_layers: int = 6,
         dropout: float = 0.1,
         max_T: int = 20,
         max_C: int = 512,
+        num_features: int = 9,
     ):
         super().__init__()
         if hidden_size % n_heads != 0:
-            raise ValueError("hidden_size must be divisible by n_heads")
+            raise ValueError(
+                f"hidden_size (d_model) must be divisible by n_heads. Got {hidden_size} and {n_heads}."
+            )
 
         self.d_model = hidden_size
         self.max_T = max_T
+        self.num_features = num_features
 
-        self.in_proj = nn.Linear(1, hidden_size)
+        self.feature_gate = FeatureGate(num_features)
+        self.in_proj = nn.Linear(num_features, hidden_size)
 
         self.time_pos = nn.Parameter(torch.zeros(1, max_T, 1, hidden_size))
         self.chan_pos_base = nn.Parameter(torch.zeros(1, 1, max_C, hidden_size))
 
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            _AxialBlock(d_model=hidden_size, n_heads=n_heads, dropout=dropout)
+            GatedAxialBlock(d_model=hidden_size, n_heads=n_heads, dropout=dropout)
             for _ in range(n_layers)
         ])
         self.out_proj = nn.Linear(hidden_size, 1)
@@ -95,19 +111,21 @@ class NFSTNDTModel(nn.Module):
         return pos
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,T,C)
-        B, T, C = x.shape
+        B, T, C, F = x.shape
         if T > self.time_pos.shape[1]:
             raise ValueError(f"T={T} exceeds max_T={self.time_pos.shape[1]}")
+        if F != self.num_features:
+            raise ValueError(f"Expected F={self.num_features}. Got {F}")
 
-        h = self.in_proj(x.unsqueeze(-1))  # (B,T,C,1)->(B,T,C,D)
+        h = self.feature_gate(x)
+        h = self.in_proj(h)
         h = h + self.time_pos[:, :T, :, :] + self._channel_pos(C)
         h = self.drop(h)
 
         for blk in self.blocks:
             h = blk(h)
 
-        y = self.out_proj(h).squeeze(-1)   # (B,T,C)
+        y = self.out_proj(h).squeeze(-1)
         return y
 
 
@@ -118,7 +136,7 @@ class Model:
     """
     Codabench entry:
       - load(): load weights based on monkey_name
-      - predict(X): X is numpy (N,20,C,9) (or occasionally (N,20,C))
+      - predict(X): X is numpy (N,20,C,9)
                    return numpy (N,20,C)
     """
     def __init__(self, monkey_name=""):
@@ -127,15 +145,16 @@ class Model:
         if self.monkey_name == "beignet":
             self.input_size = 89
             self.weight_file = "model_beignet.pth"
-            # If you trained with different hyperparams, change them here accordingly:
-            self.hidden_size = 256
+            self.stats_file = "train_data_average_std_beignet.npz"
+            self.hidden_size = 1024
             self.n_heads = 8
             self.n_layers = 6
             self.dropout = 0.1
         elif self.monkey_name == "affi":
             self.input_size = 239
             self.weight_file = "model_affi.pth"
-            self.hidden_size = 256
+            self.stats_file = "train_data_average_std_affi.npz"
+            self.hidden_size = 1024
             self.n_heads = 8
             self.n_layers = 6
             self.dropout = 0.1
@@ -143,16 +162,19 @@ class Model:
             raise ValueError(f"No such a monkey: {self.monkey_name}")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = NFSTNDTModel(
+        self.model = NFSTNDTModelV2(
+            input_size=self.input_size,
             hidden_size=self.hidden_size,
             n_heads=self.n_heads,
             n_layers=self.n_layers,
             dropout=self.dropout,
             max_T=20,
             max_C=max(self.input_size, 512),
+            num_features=9,
         ).to(self.device)
 
         self._is_loaded = False
+        self._denorm_params = None
 
     def _load_state_dict(self, state):
         # Accept plain state_dict or common checkpoint wrappers.
@@ -180,12 +202,40 @@ class Model:
         self.model.eval()
         self._is_loaded = True
 
+    def _load_denorm_params(self):
+        base = os.path.dirname(__file__)
+        path = os.path.join(base, self.stats_file)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Expected stats file at {path}")
+        stats = np.load(path)
+        avg_cf = stats["average"].astype(np.float32, copy=False)
+        std_cf = stats["std"].astype(np.float32, copy=False)
+        num_feats = avg_cf.shape[1] // self.input_size
+        avg_c_f = avg_cf.reshape(1, self.input_size, num_feats)
+        std_c_f = std_cf.reshape(1, self.input_size, num_feats)
+        combine_max = avg_c_f + 4 * std_c_f
+        combine_min = avg_c_f - 4 * std_c_f
+        self._denorm_params = (combine_min, combine_max)
+
+    def _normalize(self, x):
+        if self._denorm_params is None:
+            self._load_denorm_params()
+        combine_min, combine_max = self._denorm_params
+        return ((x - combine_min) / (combine_max - combine_min)) * 2 - 1
+
+    def _denorm_feature0(self, x):
+        if self._denorm_params is None:
+            self._load_denorm_params()
+        combine_min, combine_max = self._denorm_params
+        f0_min = combine_min[..., 0]
+        f0_max = combine_max[..., 0]
+        return ((x + 1) / 2) * (f0_max - f0_min) + f0_min
+
     @torch.inference_mode()
     def predict(self, X):
         """
         X: numpy array
           - expected: (N,20,C,9) where only first 10 steps are meaningful
-          - allowed:  (N,20,C)
         return:
           - (N,20,C) float32
         """
@@ -195,31 +245,31 @@ class Model:
         if not isinstance(X, np.ndarray):
             X = np.asarray(X)
 
-        if X.ndim == 4:
-            # use feature0 only
-            x0 = X[..., 0]  # (N,20,C)
-        elif X.ndim == 3:
-            x0 = X
-        else:
-            raise ValueError(f"Expected X with shape (N,20,C,9) or (N,20,C). Got {X.shape}")
+        if X.ndim != 4:
+            raise ValueError(f"Expected X with shape (N,20,C,9). Got {X.shape}")
 
         # basic shape check
-        if x0.shape[1] != 20:
-            raise ValueError(f"Expected T=20. Got {x0.shape[1]}")
-        if x0.shape[2] != self.input_size:
-            raise ValueError(f"Expected C={self.input_size} for {self.monkey_name}. Got {x0.shape[2]}")
+        if X.shape[1] != 20:
+            raise ValueError(f"Expected T=20. Got {X.shape[1]}")
+        if X.shape[2] != self.input_size:
+            raise ValueError(f"Expected C={self.input_size} for {self.monkey_name}. Got {X.shape[2]}")
+        if X.shape[3] != 9:
+            raise ValueError(f"Expected F=9. Got {X.shape[3]}")
 
         # enforce masking rule for inference: future repeats step9
         init_steps = 10
-        x0 = x0.astype(np.float32, copy=False)
-        x0_masked = x0.copy()
-        x0_masked[:, init_steps:, :] = x0_masked[:, init_steps-1:init_steps, :]
+        x = X.astype(np.float32, copy=False)
+        x = self._normalize(x)
+        x_masked = x.copy()
+        x_masked[:, init_steps:, :, :] = x_masked[:, init_steps-1:init_steps, :, :]
 
-        xt = torch.from_numpy(x0_masked).to(self.device)  # (N,20,C)
+        xt = torch.from_numpy(x_masked).to(self.device)  # (N,20,C,9)
 
         y_hat = self.model(xt)  # (N,20,C)
 
         # enforce competition output definition: first 10 steps are given
-        y_hat[:, :init_steps, :] = xt[:, :init_steps, :]
+        y_hat[:, :init_steps, :] = xt[:, :init_steps, :, 0]
 
-        return y_hat.detach().cpu().numpy().astype(np.float32, copy=False)
+        y_np = y_hat.detach().cpu().numpy().astype(np.float32, copy=False)
+        y_np = self._denorm_feature0(y_np)
+        return y_np.astype(np.float32, copy=False)
