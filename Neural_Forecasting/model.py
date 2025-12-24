@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
 
 
 class FeatureGate(nn.Module):
@@ -146,20 +147,33 @@ class Model:
             self.input_size = 89
             self.weight_file = "model_beignet.pth"
             self.stats_file = "train_data_average_std_beignet.npz"
-            self.hidden_size = 1024
-            self.n_heads = 8
-            self.n_layers = 6
+            self.hidden_size = 256
+            self.n_heads = 4
+            self.n_layers = 3
             self.dropout = 0.1
         elif self.monkey_name == "affi":
             self.input_size = 239
             self.weight_file = "model_affi.pth"
             self.stats_file = "train_data_average_std_affi.npz"
-            self.hidden_size = 1024
-            self.n_heads = 8
-            self.n_layers = 6
+            self.hidden_size = 256
+            self.n_heads = 4
+            self.n_layers = 3
             self.dropout = 0.1
         else:
             raise ValueError(f"No such a monkey: {self.monkey_name}")
+
+        base = os.path.dirname(__file__)
+        try:
+            stats = np.load(os.path.join(base, self.stats_file))
+            self.average = stats["average"].astype(np.float32, copy=False)
+            self.std = stats["std"].astype(np.float32, copy=False)
+        except FileNotFoundError:
+            print(
+                f"Warning: {self.stats_file} not found. "
+                "Will load during predict."
+            )
+            self.average = None
+            self.std = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = NFSTNDTModelV2(
@@ -200,16 +214,33 @@ class Model:
         self._load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
+        # # Enable faster attention kernels when available (PyTorch 2.x)
+        # try:
+        #     torch.backends.cuda.enable_flash_sdp(True)
+        #     torch.backends.cuda.enable_mem_efficient_sdp(True)
+        #     torch.backends.cuda.enable_math_sdp(False)
+        # except Exception:
+        #     pass
+
+        # # Optional compile for fixed-shape inference (PyTorch 2.x)
+        # try:
+        #     self.model = torch.compile(self.model, mode="reduce-overhead")
+        # except Exception:
+        #     pass
+
         self._is_loaded = True
 
     def _load_denorm_params(self):
-        base = os.path.dirname(__file__)
-        path = os.path.join(base, self.stats_file)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Expected stats file at {path}")
-        stats = np.load(path)
-        avg_cf = stats["average"].astype(np.float32, copy=False)
-        std_cf = stats["std"].astype(np.float32, copy=False)
+        if self.average is None or self.std is None:
+            base = os.path.dirname(__file__)
+            path = os.path.join(base, self.stats_file)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Expected stats file at {path}")
+            stats = np.load(path)
+            self.average = stats["average"].astype(np.float32, copy=False)
+            self.std = stats["std"].astype(np.float32, copy=False)
+        avg_cf = self.average
+        std_cf = self.std
         num_feats = avg_cf.shape[1] // self.input_size
         avg_c_f = avg_cf.reshape(1, self.input_size, num_feats)
         std_c_f = std_cf.reshape(1, self.input_size, num_feats)
@@ -231,8 +262,24 @@ class Model:
         f0_max = combine_max[..., 0]
         return ((x + 1) / 2) * (f0_max - f0_min) + f0_min
 
+    def _normalize_torch(self, x):
+        if self._denorm_params is None:
+            self._load_denorm_params()
+        combine_min, combine_max = self._denorm_params
+        cm = torch.from_numpy(combine_min).to(x.device)
+        cx = torch.from_numpy(combine_max).to(x.device)
+        return ((x - cm) / (cx - cm)) * 2 - 1
+
+    def _denorm_feature0_torch(self, x):
+        if self._denorm_params is None:
+            self._load_denorm_params()
+        combine_min, combine_max = self._denorm_params
+        f0_min = torch.from_numpy(combine_min[..., 0]).to(x.device)
+        f0_max = torch.from_numpy(combine_max[..., 0]).to(x.device)
+        return ((x + 1) / 2) * (f0_max - f0_min) + f0_min
+
     @torch.inference_mode()
-    def predict(self, X):
+    def predict(self, X, batch_size: int = None):
         """
         X: numpy array
           - expected: (N,20,C,9) where only first 10 steps are meaningful
@@ -259,17 +306,30 @@ class Model:
         # enforce masking rule for inference: future repeats step9
         init_steps = 10
         x = X.astype(np.float32, copy=False)
-        x = self._normalize(x)
-        x_masked = x.copy()
-        x_masked[:, init_steps:, :, :] = x_masked[:, init_steps-1:init_steps, :, :]
 
-        xt = torch.from_numpy(x_masked).to(self.device)  # (N,20,C,9)
+        if batch_size is None or batch_size <= 0:
+            batch_size = int(os.getenv("NF_BATCH_SIZE", "0")) or 1
 
-        y_hat = self.model(xt)  # (N,20,C)
+        autocast_ctx = nullcontext()
+        if self.device.type == "cuda":
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
 
-        # enforce competition output definition: first 10 steps are given
-        y_hat[:, :init_steps, :] = xt[:, :init_steps, :, 0]
+        outputs = []
+        n = x.shape[0]
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            xb = torch.from_numpy(x[start:end]).to(self.device)  # (B,20,C,9)
 
-        y_np = y_hat.detach().cpu().numpy().astype(np.float32, copy=False)
-        y_np = self._denorm_feature0(y_np)
-        return y_np.astype(np.float32, copy=False)
+            xb = self._normalize_torch(xb)
+            xb[:, init_steps:, :, :] = xb[:, init_steps - 1:init_steps, :, :]
+
+            with autocast_ctx:
+                yb = self.model(xb)  # (B,20,C)
+
+            # enforce competition output definition: first 10 steps are given
+            yb[:, :init_steps, :] = xb[:, :init_steps, :, 0]
+            yb = self._denorm_feature0_torch(yb)
+            outputs.append(yb.detach().cpu())
+
+        y_np = torch.cat(outputs, dim=0).numpy().astype(np.float32, copy=False)
+        return np.array(y_np)
