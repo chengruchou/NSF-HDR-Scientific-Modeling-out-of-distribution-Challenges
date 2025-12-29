@@ -68,7 +68,7 @@ def plot_output(y, monkey_name, channel_idx=0, sample_idx=0, out_dir=None):
 
 
 def run_single(monkey_name, stats_file, weight_file, out_dir=None):
-    from model import Model
+    from Neural_Forecasting.model_v8 import Model
 
     stats_path = resolve_path(stats_file)
     avg, std = load_stats(stats_path)
@@ -98,13 +98,13 @@ def main():
     run_single(
         "affi",
         r"Neural Forecasting\dataset\train_data_affi.npz",
-        "model_affi_v2.pth",
+        "model_affi_v8.pth",
         out_dir=out_dir,
     )
     run_single(
         "beignet",
         r"Neural Forecasting\dataset\train_data_beignet.npz",
-        "model_beignet_v2.pth",
+        "model_beignet_v8.pth",
         out_dir=out_dir,
     )
 
