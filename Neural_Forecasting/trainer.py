@@ -99,7 +99,16 @@ class Trainer():
   def save_model(self):
     if not self.save_path:
       raise ValueError("save_path is empty. Please set save_path to save weights.")
-    torch.save(self.model.state_dict(), self.save_path)
+    # Save base_model only when using wrappers to keep inference compatible.
+    if hasattr(self.model, "base_model"):
+      state = self.model.base_model.state_dict()
+    else:
+      state = self.model.state_dict()
+    keys = list(state.keys())
+    print("Saving keys:", keys[:20])
+    assert not any(k.startswith("base_model.") for k in keys), "Unexpected base_model.* prefix in saved state"
+    assert not any(k.startswith("head.") for k in keys), "Unexpected head.* in saved state"
+    torch.save(state, self.save_path)
 
   def load_model(self, path):
     state = torch.load(path, map_location="cpu")

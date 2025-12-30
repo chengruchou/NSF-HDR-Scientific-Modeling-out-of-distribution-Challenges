@@ -1,5 +1,5 @@
 """
-this is model_v9.py
+this is model_v10.py
 """
 import os
 from contextlib import nullcontext
@@ -29,14 +29,9 @@ class Time2Vec(nn.Module):
         return torch.cat([lin.unsqueeze(-1), per], dim=-1)
 
 
-class NFSTNDTModelV9(nn.Module):
+class NFSTNDTModelV10(nn.Module):
     """
-    v9: change-aware, multi-head forecasting model.
-    - Input: x (B, T, F), optional t (B, T)
-    - Adds change-aware features (dx, ddx) before the encoder to improve spike sensitivity.
-    - Two heads share the same encoder representation:
-        * value head -> multi-horizon value/quantile prediction
-        * change head -> multi-horizon change/spike prediction
+    v10: change-to-value coupling + dual encoders + weak periodic bias.
     """
     def __init__(
         self,
@@ -50,6 +45,7 @@ class NFSTNDTModelV9(nn.Module):
         time2vec_k: int = 8,
         use_delta_t: bool = True,
         quantiles: list = None,
+        alpha: float = 0.1,
     ):
         super().__init__()
         if hidden_size % n_heads != 0:
@@ -61,6 +57,7 @@ class NFSTNDTModelV9(nn.Module):
         self.n_layers = n_layers
         self.dropout = dropout
         self.quantiles = quantiles
+        self.alpha = alpha
 
         # If num_features is not provided, assume input_size already equals F.
         self.num_features = num_features if num_features is not None else input_size
@@ -73,20 +70,37 @@ class NFSTNDTModelV9(nn.Module):
             self.time2vec = Time2Vec(time2vec_k)
         else:
             self.time2vec = None
+        # v10: weak periodic inductive bias
+        self.periods = [24, 168]
+        time_dim += 2 * len(self.periods)
+
         self.use_delta_t = use_delta_t
         self.time_dim = time_dim
 
-        # Change-aware feature projection (x, dx, ddx concatenated).
-        self.in_proj = nn.Linear(self.num_features * 3 + time_dim, hidden_size)
-
-        enc_layer = nn.TransformerEncoderLayer(
+        # value encoder (level)
+        self.in_proj_value = nn.Linear(self.num_features + time_dim, hidden_size)
+        enc_layer_value = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=n_heads,
             dim_feedforward=hidden_size * 4,
             dropout=dropout,
             batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.encoder_value = nn.TransformerEncoder(enc_layer_value, num_layers=n_layers)
+
+        # change encoder (dx, ddx)
+        self.in_proj_change = nn.Linear(self.num_features * 2 + time_dim, hidden_size)
+        enc_layer_change = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder_change = nn.TransformerEncoder(enc_layer_change, num_layers=n_layers)
+
+        # fuse representations
+        self.fuse = nn.Linear(hidden_size * 2, hidden_size)
 
         # Value head: predict values or quantiles (backward compatible with v7/v8).
         if self.quantiles is None:
@@ -111,9 +125,14 @@ class NFSTNDTModelV9(nn.Module):
             feats.append(torch.log(dt).unsqueeze(-1))
         if self.time2vec is not None:
             feats.append(self.time2vec(t))
+        # periodic features
+        for p in self.periods:
+            angle = 2.0 * torch.pi * t / float(p)
+            feats.append(torch.sin(angle).unsqueeze(-1))
+            feats.append(torch.cos(angle).unsqueeze(-1))
         return torch.cat(feats, dim=-1) if feats else None
 
-    def _build_change_features(self, x: torch.Tensor) -> torch.Tensor:
+    def _build_change_features(self, x: torch.Tensor) -> tuple:
         """
         Build change-aware features:
           dx  = x[:, 1:] - x[:, :-1]
@@ -140,30 +159,67 @@ class NFSTNDTModelV9(nn.Module):
         """
         B, T, F = x.shape
 
-        # v9 change-aware feature injection to improve spike sensitivity.
-        dx, ddx = self._build_change_features(x)
-        h = torch.cat([x, dx, ddx], dim=-1)
-
         if self.time_dim > 0:
             if t is None:
                 time_feats = torch.zeros(B, T, self.time_dim, device=x.device, dtype=x.dtype)
             else:
                 time_feats = self._build_time_features(t)
-            h = torch.cat([h, time_feats], dim=-1)
+        else:
+            time_feats = None
 
-        h = self.in_proj(h)
-        h = self.encoder(h)
+        # value path
+        if time_feats is None:
+            v_in = x
+        else:
+            v_in = torch.cat([x, time_feats], dim=-1)
+        v = self.in_proj_value(v_in)
+        v = self.encoder_value(v)
 
-        y = self.value_head(h)
+        # change path
+        dx, ddx = self._build_change_features(x)
+        if time_feats is None:
+            c_in = torch.cat([dx, ddx], dim=-1)
+        else:
+            c_in = torch.cat([dx, ddx, time_feats], dim=-1)
+        c = self.in_proj_change(c_in)
+        c = self.encoder_change(c)
+
+        # fuse
+        h = torch.cat([v, c], dim=-1)
+        h = self.fuse(h)
+
+        y_base = self.value_head(h)
         if self.quantiles is None:
-            y = y.squeeze(-1)  # (B, T)
+            y_base = y_base.squeeze(-1)  # (B, T)
 
         dy = self.change_head(h).squeeze(-1)  # (B, T)
 
+        # change-to-value coupling
+        # if y_base.dim() == 3:
+        #     y_corr = y_base + self.alpha * torch.sigmoid(dy).unsqueeze(-1)
+        # else:
+        #     y_corr = y_base + self.alpha * torch.sigmoid(dy)
+
+        # return {
+        #     "y_pred": y_corr,
+        #     "dy_pred": dy,
+        # }
+
+        # dy_pred: (B, T)
+        # y_base: (B, T) or (B, T, Q)
+
+        corr = torch.tanh(dy)  # zero-mean, bounded
+
+        if y_base.dim() == 3:
+            corr = corr.unsqueeze(-1)
+
+        y_corr = y_base + self.alpha * corr
+
         return {
-            "y_pred": y,
+            "y_pred": y_corr,
             "dy_pred": dy,
         }
+
 
 
 class Model:
@@ -184,12 +240,12 @@ class Model:
 
         if self.monkey_name == "beignet":
             self.input_size = 89
-            self.weight_file = "model_beignet_v9.pth"
-            self.stats_file = "train_data_average_std_beignet.npz"
+            self.weight_file = "model_beignet_v10.pth"
+            self.stats_file = "train_data_average_std_beignet_v10.npz"
         elif self.monkey_name == "affi":
             self.input_size = 239
-            self.weight_file = "model_affi_v9.pth"
-            self.stats_file = "train_data_average_std_affi.npz"
+            self.weight_file = "model_affi_v10.pth"
+            self.stats_file = "train_data_average_std_affi_v10.npz"
         else:
             raise ValueError(f"No such a monkey: {self.monkey_name}")
 
@@ -207,7 +263,7 @@ class Model:
             self.std = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = NFSTNDTModelV9(
+        self.model = NFSTNDTModelV10(
             input_size=9,
             hidden_size=self.hidden_size,
             n_heads=self.n_heads,
@@ -215,6 +271,7 @@ class Model:
             dropout=self.dropout,
             num_features=9,
             quantiles=self.quantiles,
+            alpha=0.1,
         ).to(self.device)
 
         self._is_loaded = False
@@ -293,8 +350,8 @@ class Model:
         t = torch.arange(x.shape[1], device=x.device, dtype=x.dtype)
         return t.unsqueeze(0).repeat(x.shape[0], 1)
 
-    def _forward_v9(self, x, t):
-        # x: (B, T, C, F) -> run v9 on (B*C, T, F)
+    def _forward_v10(self, x, t):
+        # x: (B, T, C, F) -> run v10 on (B*C, T, F)
         B, T, C, F = x.shape
         x_flat = x.permute(0, 2, 1, 3).contiguous().view(B * C, T, F)
         t_flat = t.unsqueeze(1).repeat(1, C, 1).view(B * C, T)
@@ -353,11 +410,19 @@ class Model:
 
             t_in = self._build_time_tensor(xb)
             with autocast_ctx:
-                yb_q = self._forward_v9(xb, t_in)  # (B,20,C,Q)
+                yb_q = self._forward_v10(xb, t_in)  # (B,20,C,Q)
 
             if yb_q.shape[-1] > 1:
-                median_idx = self.quantiles.index(0.5)
-                yb = yb_q[..., median_idx]
+                q_map = {float(q): i for i, q in enumerate(self.quantiles)}
+                if 0.1 in q_map and 0.5 in q_map and 0.9 in q_map:
+                    q10 = yb_q[..., q_map[0.1]]
+                    q50 = yb_q[..., q_map[0.5]]
+                    q90 = yb_q[..., q_map[0.9]]
+                    yb = 0.7 * q50 + 0.15 * q10 + 0.15 * q90
+                elif 0.5 in q_map:
+                    yb = yb_q[..., q_map[0.5]]
+                else:
+                    yb = yb_q.mean(dim=-1)
             else:
                 yb = yb_q.squeeze(-1)
 
