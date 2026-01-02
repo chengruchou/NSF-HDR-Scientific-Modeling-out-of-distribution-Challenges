@@ -1,6 +1,3 @@
-# ==========================================
-# 檔名：model.py (這是要上傳的檔案)
-# ==========================================
 import argparse
 import pandas as pd
 import numpy as np
@@ -16,8 +13,9 @@ warnings.filterwarnings('ignore')
 
 HIST_WINDOW = 7
 PRED_WINDOW = 14
-# 你可以在這裡微調門檻，例如 -0.05
-BEST_THRESHOLD = -0.2400
+
+# ⚠️ 請填入 train_local.py 跑出來的最佳門檻
+BEST_THRESHOLD = 0
 
 class FloodModel:
     def __init__(self):
@@ -25,35 +23,31 @@ class FloodModel:
         self.threshold_map = {}
 
     def preprocess_data_to_dict(self, df_hourly, path_thresholds=None):
-        """極速預處理：轉為 Dictionary Cache"""
         print("Preprocessing data for fast lookup...")
         df_hourly['time'] = pd.to_datetime(df_hourly['time'])
         
-        # 載入門檻
         if path_thresholds and os.path.exists(path_thresholds):
             try:
                 thresh_data = sio.loadmat(path_thresholds)
-                try:
-                    if 'sname' in thresh_data:
-                        try:
-                            th_names = [s.item() for s in thresh_data['sname'].flatten()]
-                        except:
-                            th_names = [s[0][0] for s in thresh_data['sname']]
-                    th_vals = thresh_data['thminor_stnd'].flatten()
-                    self.threshold_map = dict(zip(th_names, th_vals))
-                except: pass
+                if 'sname' in thresh_data:
+                    try:
+                        th_names = [s.item() for s in thresh_data['sname'].flatten()]
+                    except:
+                        th_names = [s[0][0] for s in thresh_data['sname']]
+                th_vals = thresh_data['thminor_stnd'].flatten()
+                self.threshold_map = dict(zip(th_names, th_vals))
             except: pass
         
         df_hourly['flood_threshold'] = df_hourly['station_name'].map(self.threshold_map).fillna(3.0)
         
-        print("Aggregating to daily...")
+        print("Aggregating...")
         df_daily = df_hourly.groupby(['station_name', pd.Grouper(key='time', freq='D')]).agg({
             'sea_level': ['mean', 'max'], 
             'flood_threshold': 'first'
         }).reset_index()
         df_daily.columns = ['station_name', 'time', 'sl_mean', 'sl_max', 'threshold']
 
-        print("Generating features...")
+        print("Features...")
         df_daily['month_sin'] = np.sin(2 * np.pi * df_daily['time'].dt.month / 12)
         df_daily['month_cos'] = np.cos(2 * np.pi * df_daily['time'].dt.month / 12)
         df_daily['year_norm'] = (df_daily['time'].dt.year - 1950) / 70
@@ -70,7 +64,6 @@ class FloodModel:
 
         df_daily = df_daily.fillna(0)
 
-        # 建立 Cache
         data_cache = {}
         feat_cols = ['sl_mean', 'sl_max', 'month_sin', 'month_cos', 'year_norm', 'threshold',
                      'dist_to_threshold', 'dist_mean_3d', 'dist_mean_7d',
@@ -90,38 +83,32 @@ class FloodModel:
             with open(load_model_path, 'rb') as f:
                 self.models = pickle.load(f)
         else:
-            print("Error: Model not found!")
             return
 
-        print(f"Reading test index: {test_index_path}")
         try:
             test_intervals = pd.read_csv(test_index_path)
         except: return
 
-        # 欄位標準化
         test_intervals.columns = [c.strip().lower() for c in test_intervals.columns]
         if 'hist_start' in test_intervals.columns:
             test_intervals = test_intervals.rename(columns={'hist_start': 'start_date', 'hist_end': 'end_date'})
         if 'start_date' not in test_intervals.columns and len(test_intervals.columns) >= 4:
              test_intervals['start_date'] = test_intervals.iloc[:, 2]
              test_intervals['end_date'] = test_intervals.iloc[:, 3]
-
-        test_intervals['start_date'] = pd.to_datetime(test_intervals['start_date'])
-        test_intervals['end_date'] = pd.to_datetime(test_intervals['end_date'])
-
-        # 確保有 id (scoring.py 需要)
         if 'id' not in test_intervals.columns:
             test_intervals['id'] = range(len(test_intervals))
 
+        test_intervals['end_date'] = pd.to_datetime(test_intervals['end_date'])
+
         results_ids = []
-        results_labels = []
+        results_probs = []
         
-        print(f"Processing {len(test_intervals)} entries...")
+        print(f"Processing {len(test_intervals)} requests...")
         
         for stn, group in test_intervals.groupby('station_name'):
             if stn not in data_cache:
                 results_ids.extend(group['id'].values)
-                results_labels.extend([0] * len(group))
+                results_probs.extend([0.0] * len(group))
                 continue
             
             date_map, matrix = data_cache[stn]
@@ -138,30 +125,36 @@ class FloodModel:
                         valid_rows.append(row['id'])
                     else:
                         results_ids.append(row['id'])
-                        results_labels.append(0)
+                        results_probs.append(0.0)
                 else:
                     results_ids.append(row['id'])
-                    results_labels.append(0)
+                    results_probs.append(0.0)
             
             if not batch_X: continue
             
             batch_X = np.array(batch_X)
-            preds_matrix = np.zeros((len(batch_X), PRED_WINDOW))
-            for d in range(PRED_WINDOW):
-                preds_matrix[:, d] = self.models[d].predict(batch_X)
             
-            # 取未來 14 天是否有一天 > 門檻
-            max_preds = np.max(preds_matrix, axis=1)
-            final_labels = (max_preds > BEST_THRESHOLD).astype(int)
+            batch_preds = np.zeros((len(batch_X), PRED_WINDOW))
+            for d in range(PRED_WINDOW):
+                batch_preds[:, d] = self.models[d].predict(batch_X)
+            
+            # 取最大距離
+            max_dist = np.max(batch_preds, axis=1)
+            
+            # === 關鍵：Sigmoid 轉換 ===
+            # 將 (dist - threshold) 轉換為 (0.5 周圍的機率)
+            # dist > threshold -> prob > 0.5
+            # dist < threshold -> prob < 0.5
+            # 乘以 10 是為了讓 Sigmoid 更陡峭，模擬高信心度
+            calibrated_probs = 1 / (1 + np.exp(-(max_dist - BEST_THRESHOLD) * 10))
             
             results_ids.extend(valid_rows)
-            results_labels.extend(final_labels)
+            results_probs.extend(calibrated_probs)
 
-        output_df = pd.DataFrame({'id': results_ids, 'label': results_labels})
+        output_df = pd.DataFrame({'id': results_ids, 'y_prob': results_probs})
         output_df = output_df.sort_values('id')
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        print(f"Saving {len(output_df)} predictions to {output_path}...")
         output_df.to_csv(output_path, index=False)
         print("Done!")
 
@@ -175,15 +168,12 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
     
     pipeline = FloodModel()
-    
     input_dir = os.path.dirname(args.test_hourly)
     thresh_path = os.path.join(input_dir, 'Seed_Coastal_Stations_Thresholds.mat')
     if not os.path.exists(thresh_path):
          thresh_path = os.path.join(os.path.dirname(input_dir), 'input_data', 'Seed_Coastal_Stations_Thresholds.mat')
-
+    
     if os.path.exists(args.test_hourly):
         df_hourly = pd.read_csv(args.test_hourly)
         data_cache = pipeline.preprocess_data_to_dict(df_hourly, thresh_path)
         pipeline.generate_submission(data_cache, args.test_index, args.predictions_out, load_model_path='model.pkl')
-    else:
-        print(f"Error: Test data not found at {args.test_hourly}")
