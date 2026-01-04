@@ -43,7 +43,7 @@ def run_simulation():
     print("Step 2: 執行您的 model.py...")
     # 這是模擬 ingestion.py 的呼叫方式
     cmd = [
-        sys.executable, "-m", "model",
+        sys.executable, "-m", "model_xgb_15_feat",
         "--train_hourly", "input_data/test_hourly.csv", # 這裡隨便給一個，因為我們是 Inference Only
         "--test_hourly", "input_data/test_hourly.csv",
         "--test_index", "input_data/test_index.csv",
