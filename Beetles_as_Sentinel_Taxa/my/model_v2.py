@@ -137,7 +137,7 @@ class EventMILModelV2(nn.Module):
             attn_logits = attn_logits.masked_fill(~attention_mask, attn_min)
         attn_logits = self.attn_dropout(attn_logits)
         attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)
-        attn_pooled = (attn_weights * feats).sum(dim=1)
+        attn_pooled = (attn_weights * attn_input).sum(dim=1)
 
         if self.training and domain_dropout_prob > 0:
             drop_mask = torch.rand_like(domain_id.float()) < domain_dropout_prob

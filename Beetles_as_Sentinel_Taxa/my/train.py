@@ -20,7 +20,7 @@ from utils import (
     get_training_args,
     gaussian_crps,
 )
-from model import EventMILModel
+from model_v1 import EventMILModel
 from model_v2 import EventMILModelV2, Model as InferenceModelV2
 
 
