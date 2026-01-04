@@ -1,140 +1,395 @@
-import json
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
-import numpy as np
+# Added progressive unfreeze to stabilize OOD/SMOOD CRPS by gradually widening trainable backbone.
+# The schedule unlocks layer3 at epoch 10 (LR stays 0.1x) and layer2 at epoch 15 (LR drops to 0.01x).
+import math
 from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from datasets import load_dataset
 
 from utils import (
+    build_transforms,
+    collate_events,
+    evaluate_spei_r2_scores,
+    EventDataset,
     get_training_args,
-    get_dino_and_transforms, # Changed to DINO loader
-    evalute_spei_r2_scores,
-    extract_spatial_features_with_metadata,
-    get_collate_fn,
+    gaussian_crps,
 )
-from model import GrandBeetleModel
+from model import EventMILModel
+from model_v2 import EventMILModelV2, Model as InferenceModelV2
 
-def train(model, train_loader, val_loader, lr, epochs, save_dir, domain_aug_prob):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-    save_path = Path(save_dir) / "dino_grand_model.pth"
-    best_r2 = -float('inf')
 
-    print(f"🚀 Training with {len(train_loader.dataset)} samples")
+def _gaussian_nll(mu, sigma, target):
+    var = sigma ** 2
+    return 0.5 * ((target - mu) ** 2 / var + torch.log(var)).mean()
+
+
+def _gaussian_crps(mu, sigma, target):
+    z = (target - mu) / sigma
+    sqrt_2 = math.sqrt(2.0)
+    phi = torch.exp(-0.5 * z ** 2) / math.sqrt(2.0 * math.pi)
+    Phi = 0.5 * (1.0 + torch.erf(z / sqrt_2))
+    crps = sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+    return crps.mean()
+
+
+def _set_backbone_requires_grad(model, layer_prefixes, requires_grad):
+    for name, param in model.backbone.named_parameters():
+        for prefix in layer_prefixes:
+            if name.startswith(prefix + ".") or name == prefix:
+                param.requires_grad = requires_grad
+                break
+
+
+def _backbone_layer_trainable(model, layer_prefix):
+    for name, param in model.backbone.named_parameters():
+        if name.startswith(layer_prefix + ".") or name == layer_prefix:
+            if param.requires_grad:
+                return True
+    return False
+
+
+def train(
+    model,
+    train_loader,
+    val_loader,
+    lr,
+    epochs,
+    save_path,
+    domain_aug_prob,
+    target_mean,
+    target_std,
+    amp_enabled,
+    grad_accum,
+    image_size,
+    calib_size,
+    max_instances,
+    model_version,
+):
+    backbone_params = list(model.backbone.parameters())
+    backbone_param_ids = {id(p) for p in backbone_params}
+    head_params = [p for p in model.parameters() if id(p) not in backbone_param_ids]
+
+    backbone_lr = lr * 0.1 if model_version == "v1" else 0.0
+    optimizer = optim.AdamW(
+        [
+            {"params": head_params, "lr": lr},
+            {"params": backbone_params, "lr": backbone_lr},
+        ]
+    )
+    scaler = GradScaler("cuda", enabled=amp_enabled)
+    best_val_crps = float("inf")
+    patience = 5
+    patience_left = patience
+    device = next(model.parameters()).device
+
+    print(f"Training with {len(train_loader.dataset)} events")
+    print(f"Initial Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
 
     for epoch in range(epochs):
+        epoch_num = epoch + 1
+        if model_version == "v2":
+            if epoch_num == 4 and not _backbone_layer_trainable(model, "layer4"):
+                _set_backbone_requires_grad(
+                    model, ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"], True
+                )
+                optimizer.param_groups[1]["lr"] = 1e-5
+                print("Unfreeze all backbone layers at epoch 4")
+                print(f"Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
+        else:
+            if epoch_num == 10 and not _backbone_layer_trainable(model, "layer3"):
+                _set_backbone_requires_grad(model, ["layer3"], True)
+                print("Unfreeze layer3 at epoch 10")
+                print(f"Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
+            if epoch_num == 15 and not _backbone_layer_trainable(model, "layer2"):
+                _set_backbone_requires_grad(model, ["layer2"], True)
+                optimizer.param_groups[1]["lr"] = lr * 0.01
+                print("Unfreeze layer2 at epoch 15")
+                print(f"Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
+
         model.train()
         train_loss = 0.0
-        preds, gts = [], []
+        optimizer.zero_grad(set_to_none=True)
+        step = 0
 
-        for feats, targets, sp_ids, dom_ids in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-            feats, targets = feats.cuda(), targets.cuda()
-            sp_ids, dom_ids = sp_ids.cuda(), dom_ids.cuda()
+        try:
+            for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch_num}"), start=1):
+                images = batch["images"].to(device, non_blocking=True)
+                species_ids = batch["species_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                color = batch["color"].to(device, non_blocking=True)
+                scale = batch["scale"].to(device, non_blocking=True)
+                domain_id = batch["domain_id"].to(device, non_blocking=True)
+                targets = batch["target"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(feats, sp_ids, dom_ids, domain_dropout_prob=domain_aug_prob)
-            loss = loss_fn(outputs, targets)
-            loss.backward()
-            optimizer.step()
+                targets_norm = (targets - target_mean) / target_std
+                with autocast(device_type="cuda", enabled=amp_enabled):
+                    outputs = model(
+                        images,
+                        species_ids,
+                        attention_mask,
+                        color,
+                        scale,
+                        domain_id,
+                        domain_aug_prob,
+                    )
+                    mu = outputs[:, :3]
+                    log_sigma = outputs[:, 3:]
+                    log_sigma = log_sigma.clamp(-6.0, 3.0)
+                    sigma = F.softplus(log_sigma) + 1e-3
+                    loss = _gaussian_crps(mu, sigma, targets_norm)
+                    if not torch.isfinite(loss):
+                        loss = _gaussian_nll(mu, sigma, targets_norm)
+                    loss = loss + 1e-3 * sigma.mean()
+                    loss = loss / max(grad_accum, 1)
 
-            train_loss += loss.item()
-            preds.extend(outputs.detach().cpu().numpy())
-            gts.extend(targets.detach().cpu().numpy())
+                scaler.scale(loss).backward()
+                if step % grad_accum == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
-        # Validation
+                train_loss += loss.item() * max(grad_accum, 1)
+
+            if step > 0 and step % grad_accum != 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(
+                    "CUDA OOM: try reducing batch_size, max_instances, image_size, "
+                    "or enable amp / increase grad_accum."
+                )
+            raise
+
         model.eval()
         val_preds, val_gts = [], []
+        val_crps = 0.0
+        val_batches = 0
+        tm = target_mean.detach().cpu().numpy()
+        ts = target_std.detach().cpu().numpy()
         with torch.no_grad():
-            for feats, targets, sp_ids, dom_ids in val_loader:
-                feats, targets = feats.cuda(), targets.cuda()
-                sp_ids, dom_ids = sp_ids.cuda(), dom_ids.cuda()
-                outputs = model(feats, sp_ids, dom_ids, domain_dropout_prob=0.0)
-                val_preds.extend(outputs.detach().cpu().numpy())
-                val_gts.extend(targets.detach().cpu().numpy())
+            for batch in val_loader:
+                images = batch["images"].to(device, non_blocking=True)
+                species_ids = batch["species_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                color = batch["color"].to(device, non_blocking=True)
+                scale = batch["scale"].to(device, non_blocking=True)
+                domain_id = batch["domain_id"].to(device, non_blocking=True)
+                targets = batch["target"].to(device, non_blocking=True)
 
-        # Metrics
-        val_r2 = evalute_spei_r2_scores(np.array(val_gts), np.array(val_preds))
-        avg_val_r2 = sum(val_r2) / 3.0
+                with autocast(device_type="cuda", enabled=amp_enabled):
+                    outputs = model(images, species_ids, attention_mask, color, scale, domain_id, 0.0)
+                    mu = outputs[:, :3]
+                    log_sigma = outputs[:, 3:]
+                    log_sigma = log_sigma.clamp(-6.0, 3.0)
+                    sigma = F.softplus(log_sigma) + 1e-3
+                mu_np = mu.detach().cpu().numpy()
+                sigma_np = sigma.detach().cpu().numpy()
+                mu_denorm = mu_np * ts + tm
+                sigma_denorm = sigma_np * ts
+                targets_np = targets.detach().cpu().numpy()
+                val_preds.extend(mu_denorm)
+                val_gts.extend(targets_np)
 
-        if avg_val_r2 > best_r2:
-            best_r2 = avg_val_r2
-            torch.save(model.state_dict(), save_path)
+                batch_crps = gaussian_crps(targets_np, mu_denorm, sigma_denorm)
+                val_crps += float(np.mean(batch_crps))
+                val_batches += 1
 
-        print(f"Epoch {epoch}: Train Loss {train_loss:.4f} | Val R2 {avg_val_r2:.4f} (Best: {best_r2:.4f})")
+        val_r2 = evaluate_spei_r2_scores(np.array(val_gts), np.array(val_preds))
+        valid_r2 = [score for score in val_r2 if score is not None and np.isfinite(score)]
+        avg_val_r2 = float(np.mean(valid_r2)) if valid_r2 else float("nan")
+        avg_val_crps = val_crps / max(val_batches, 1)
+
+        if avg_val_crps < best_val_crps:
+            best_val_crps = avg_val_crps
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "species_to_idx": model.species_to_idx,
+                    "domain_to_idx": model.domain_to_idx,
+                    "target_mean": target_mean.detach().cpu().tolist(),
+                    "target_std": target_std.detach().cpu().tolist(),
+                    "backbone_name": "resnet50",
+                    "model_version": model_version,
+                    "image_size": image_size,
+                    "calib_size": calib_size,
+                    "max_instances": max_instances,
+                },
+                save_path,
+            )
+            patience_left = patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                print(f"Early stopping at epoch {epoch_num} with best Val CRPS {best_val_crps:.4f}")
+                break
+
+        print(
+            f"Epoch {epoch_num}: Train Loss {train_loss:.4f} | "
+            f"Val CRPS {avg_val_crps:.4f} (Best: {best_val_crps:.4f}) | "
+            f"Val R2 {avg_val_r2:.4f}"
+        )
+
 
 def main():
     args = get_training_args()
+    if args.sanity_check:
+        quick_sanity_check()
+        return
     save_dir = Path(__file__).resolve().parent
+    save_path = save_dir / args.checkpoint_name
 
-    # 1. Load Dataset
-    print("📂 Loading Dataset...")
-    ds = load_dataset("imageomics/sentinel-beetles", token=args.hf_token)
+    print("Loading Dataset...")
+    ds = load_dataset("imageomics/sentinel-beetles")
 
-    # Mappings
-    all_species = set(ds['train']['scientificName']) | set(ds['validation']['scientificName'])
-    species_map = {name: i+1 for i, name in enumerate(sorted(all_species))}
-    species_map['Unknown'] = 0
+    all_species = set(ds["train"]["scientificName"]) | set(ds["validation"]["scientificName"])
+    species_map = {name: i + 1 for i, name in enumerate(sorted(all_species))}
+    species_map["Unknown"] = 0
 
-    all_domains = set(ds['train']['domainID']) | set(ds['validation']['domainID'])
-    domain_map = {name: i+1 for i, name in enumerate(sorted(all_domains))}
-    domain_map['Unknown'] = 0
+    all_domains = set(ds["train"]["domainID"]) | set(ds["validation"]["domainID"])
+    domain_map = {}
+    next_idx = 1
+    for name in sorted(all_domains):
+        try:
+            key = int(name)
+        except (TypeError, ValueError):
+            key = 0
+        if key not in domain_map and key != 0:
+            domain_map[key] = next_idx
+            next_idx += 1
+    domain_map[0] = 0
 
-    # 2. Load DINO & Preprocess
-    backbone, transforms = get_dino_and_transforms()
+    img_transform, calib_transform = build_transforms(args.image_size, args.calib_size)
+    train_events = EventDataset(
+        ds["train"],
+        species_map,
+        domain_map,
+        img_transform,
+        calib_transform,
+        max_instances=args.max_instances,
+        sample_strategy=args.sample_strategy,
+    )
+    val_events = EventDataset(
+        ds["validation"],
+        species_map,
+        domain_map,
+        img_transform,
+        calib_transform,
+        max_instances=args.max_instances,
+        sample_strategy=args.sample_strategy,
+    )
 
-    def preprocess(examples):
-        # DINO expects 224x224 RGB
-        examples["pixel_values"] = [transforms(img.convert("RGB")) for img in examples["file_path"]]
-        examples["species_idx"] = [species_map.get(s, 0) for s in examples["scientificName"]]
-        examples["domain_idx"] = [domain_map.get(d, 0) for d in examples["domainID"]]
-        return examples
+    train_targets = torch.tensor(
+        [[ex["SPEI_30d"], ex["SPEI_1y"], ex["SPEI_2y"]] for ex in ds["train"]],
+        dtype=torch.float32,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_mean = train_targets.mean(dim=0).to(device)
+    target_std = train_targets.std(dim=0).clamp_min(1e-6).to(device)
 
-    train_ds = ds["train"].with_transform(preprocess)
-    val_ds = ds["validation"].with_transform(preprocess)
+    train_loader = DataLoader(
+        train_events,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_events,
+        pin_memory=True,
+    )
+    print(f"train_loader with {len(train_loader.dataset)} events")
+    val_loader = DataLoader(
+        val_events,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_events,
+        pin_memory=True,
+    )
+    print(f"val_loader with {len(val_loader.dataset)} events")
 
-    # 3. Extract Features (FIX: num_workers=0)
-    dataloaders = {}
-    extracted_data = {}
-
-    for split, dset in zip(["train", "val"], [train_ds, val_ds]):
-        print(f"📸 Extracting DINO features for {split}...")
-
-        # ERROR FIX IS HERE: num_workers=0
-        loader = DataLoader(
-            dset,
-            batch_size=args.batch_size,
-            num_workers=0,
-            collate_fn=get_collate_fn(other_columns=["species_idx", "domain_idx"])
+    if args.model_version == "v2":
+        model = EventMILModelV2(num_species=len(species_map), num_domains=len(domain_map))
+    else:
+        model = EventMILModel(num_species=len(species_map), num_domains=len(domain_map))
+    model.species_to_idx = species_map
+    model.domain_to_idx = domain_map
+    if args.model_version == "v1" and args.freeze_backbone:
+        model.freeze_backbone_stages(args.freeze_backbone)
+        print(f"Backbone frozen until layer{args.freeze_backbone} (only upper layers + head trainable)")
+    if args.model_version == "v2":
+        _set_backbone_requires_grad(
+            model, ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"], False
         )
+        print("Backbone frozen for first 3 epochs")
+    model = model.to(device)
+    amp_enabled = bool(args.amp and device.type == "cuda")
 
-        feats, targets, sp_ids, dom_ids = extract_spatial_features_with_metadata(
-            loader, backbone, backbone_type="dino"
+    train(
+        model,
+        train_loader,
+        val_loader,
+        args.lr,
+        args.epochs,
+        save_path,
+        args.domain_id_aug_prob,
+        target_mean,
+        target_std,
+        amp_enabled,
+        args.grad_accum,
+        args.image_size,
+        args.calib_size,
+        args.max_instances,
+        args.model_version,
+    )
+
+
+def quick_sanity_check():
+    print("Running sanity check...")
+    import evaluation  # noqa: F401
+    import utils  # noqa: F401
+    import model_v2  # noqa: F401
+    import train  # noqa: F401
+
+    checkpoint = Path(__file__).resolve().parent / "model.pth"
+    model = InferenceModelV2(checkpoint_path=str(checkpoint))
+    if checkpoint.exists():
+        model.load()
+        print("Loaded checkpoint for sanity check.")
+    else:
+        print("Checkpoint not found; skipping load.")
+
+    ds = load_dataset("imageomics/sentinel-beetles")
+    if len(ds["validation"]) == 0:
+        print("No validation samples available; skipping predict.")
+        return
+
+    sample_rows = [ds["validation"][0]]
+    if len(ds["validation"]) > 1:
+        sample_rows.append(ds["validation"][1])
+    batch = []
+    for row in sample_rows:
+        batch.append(
+            {
+                "scientificName": row.get("scientificName", "Unknown"),
+                "domainID": row.get("domainID", 0),
+                "relative_img": row.get("relative_img"),
+                "file_path": row.get("file_path"),
+                "image": row.get("image"),
+                "colorpicker_img": row.get("colorpicker_img"),
+                "colorpicker_path": row.get("colorpicker_path"),
+                "scalebar_img": row.get("scalebar_img"),
+                "scalebar_path": row.get("scalebar_path"),
+            }
         )
+    pred = model.predict(batch)
+    print("Sanity check prediction keys:", list(pred.keys()))
 
-        extracted_data[split] = DataLoader(
-            TensorDataset(feats, targets, sp_ids, dom_ids),
-            batch_size=args.batch_size,
-            shuffle=(split == "train"),
-            num_workers=args.num_workers # Can use workers here since data is in RAM
-        )
-
-    # 4. Clean up DINO to save VRAM
-    del backbone
-    torch.cuda.empty_cache()
-
-    # 5. Initialize Model
-    # DINO ViT-B/14 output dim is 768
-    model = GrandBeetleModel(
-        backbone=None,
-        num_species=len(species_map),
-        num_domains=len(domain_map),
-        backbone_dim=768
-    ).cuda()
-
-    train(model, extracted_data["train"], extracted_data["val"], args.lr, args.epochs, save_dir, args.domain_id_aug_prob)
 
 if __name__ == "__main__":
     main()

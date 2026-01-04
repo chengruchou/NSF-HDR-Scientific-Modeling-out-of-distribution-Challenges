@@ -1,5 +1,4 @@
 import os
-from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 from PIL import Image
@@ -7,6 +6,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms, models
+
+
+class MixStyle(nn.Module):
+    def __init__(self, p: float = 0.5, alpha: float = 0.2, eps: float = 1e-6):
+        super().__init__()
+        self.p = p
+        self.alpha = alpha
+        self.eps = eps
+
+    def forward(self, x):
+        if not self.training or self.p <= 0:
+            return x
+        if torch.rand(1, device=x.device).item() > self.p:
+            return x
+        if x.dim() == 4:
+            mu = x.mean(dim=(2, 3), keepdim=True)
+            sigma = x.var(dim=(2, 3), keepdim=True, unbiased=False).add(self.eps).sqrt()
+            shape = (x.size(0), 1, 1, 1)
+        elif x.dim() == 2:
+            mu = x.mean(dim=1, keepdim=True)
+            sigma = x.var(dim=1, keepdim=True, unbiased=False).add(self.eps).sqrt()
+            shape = (x.size(0), 1)
+        else:
+            return x
+
+        perm = torch.randperm(x.size(0), device=x.device)
+        mu_perm = mu[perm]
+        sigma_perm = sigma[perm]
+        lam = torch.distributions.Beta(self.alpha, self.alpha).sample(shape).to(x.device)
+
+        mu_mix = lam * mu + (1.0 - lam) * mu_perm
+        sigma_mix = lam * sigma + (1.0 - lam) * sigma_perm
+        x_norm = (x - mu) / sigma
+        return x_norm * sigma_mix + mu_mix
 
 
 class SmallCalibCNN(nn.Module):
@@ -29,7 +62,7 @@ class SmallCalibCNN(nn.Module):
         return x.view(x.size(0), -1)
 
 
-class EventMILModel(nn.Module):
+class EventMILModelV2(nn.Module):
     def __init__(
         self,
         num_species: int,
@@ -37,9 +70,12 @@ class EventMILModel(nn.Module):
         embedding_dim: int = 64,
         domain_emb_dim: int = 32,
         attn_dim: int = 256,
+        attn_dropout: float = 0.1,
+        mixstyle_p: float = 0.5,
+        mixstyle_alpha: float = 0.2,
     ):
         super().__init__()
-        backbone = models.resnet50(weights=None)
+        backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         backbone.fc = nn.Identity()
         self.backbone = backbone
 
@@ -50,6 +86,9 @@ class EventMILModel(nn.Module):
         self.attn_fc_v = nn.Linear(attn_in_dim, attn_dim)
         self.attn_fc_u = nn.Linear(attn_in_dim, attn_dim)
         self.attn_score = nn.Linear(attn_dim, 1, bias=False)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+
+        self.mixstyle = MixStyle(p=mixstyle_p, alpha=mixstyle_alpha)
 
         self.color_encoder = SmallCalibCNN(out_dim=128)
         self.scale_encoder = SmallCalibCNN(out_dim=128)
@@ -58,9 +97,8 @@ class EventMILModel(nn.Module):
             nn.ReLU(),
         )
 
-        pooled_dim = 2048 * 3
         self.head = nn.Sequential(
-            nn.Linear(pooled_dim + 256, 512),
+            nn.Linear(attn_in_dim + 256, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -69,23 +107,6 @@ class EventMILModel(nn.Module):
 
         self.species_to_idx: Dict[str, int] = {}
         self.domain_to_idx: Dict[int, int] = {}
-
-    def freeze_backbone_stages(self, freeze_until=3):
-        stage_order = ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"]
-        if isinstance(freeze_until, str):
-            stage = freeze_until
-        else:
-            if freeze_until < 0 or freeze_until > 4:
-                raise ValueError("freeze_until must be in [0, 4] or a stage name")
-            stage = f"layer{freeze_until}" if freeze_until > 0 else "bn1"
-        if stage not in stage_order:
-            raise ValueError(f"Unknown freeze_until stage: {freeze_until}")
-        freeze_prefixes = stage_order[: stage_order.index(stage) + 1]
-        for name, param in self.backbone.named_parameters():
-            for prefix in freeze_prefixes:
-                if name.startswith(prefix + ".") or name == prefix:
-                    param.requires_grad = False
-                    break
 
     def forward(
         self,
@@ -96,22 +117,14 @@ class EventMILModel(nn.Module):
         scale,
         domain_id,
         domain_dropout_prob=0.0,
-        backbone_chunk: int = 16,
     ):
         batch_size, max_n = images.shape[:2]
         flat_images = images.view(batch_size * max_n, *images.shape[2:])
         flat_species = species_ids.view(batch_size * max_n)
 
-        feats_list = []
-        context = (
-            torch.no_grad()
-            if not any(p.requires_grad for p in self.backbone.parameters())
-            else nullcontext()
-        )
-        with context:
-            for i in range(0, flat_images.size(0), backbone_chunk):
-                feats_list.append(self.backbone(flat_images[i : i + backbone_chunk]))
-        feats = torch.cat(feats_list, dim=0).view(batch_size, max_n, -1)
+        feats = self.backbone(flat_images)
+        feats = self.mixstyle(feats)
+        feats = feats.view(batch_size, max_n, -1)
         sp_emb = self.species_embed(flat_species).view(batch_size, max_n, -1)
         attn_input = torch.cat([feats, sp_emb], dim=2)
 
@@ -122,21 +135,9 @@ class EventMILModel(nn.Module):
         if attention_mask is not None:
             attn_min = torch.finfo(attn_logits.dtype).min
             attn_logits = attn_logits.masked_fill(~attention_mask, attn_min)
+        attn_logits = self.attn_dropout(attn_logits)
         attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)
         attn_pooled = (attn_weights * feats).sum(dim=1)
-
-        if attention_mask is None:
-            mean_pooled = feats.mean(dim=1)
-            max_pooled = feats.max(dim=1).values
-        else:
-            mask = attention_mask.unsqueeze(-1)
-            denom = mask.sum(dim=1).clamp_min(1)
-            mean_pooled = (feats * mask).sum(dim=1) / denom
-            feats_min = torch.finfo(feats.dtype).min
-            masked_feats = feats.masked_fill(~mask, feats_min)
-            max_pooled = masked_feats.max(dim=1).values
-
-        pooled = torch.cat([attn_pooled, mean_pooled, max_pooled], dim=1)
 
         if self.training and domain_dropout_prob > 0:
             drop_mask = torch.rand_like(domain_id.float()) < domain_dropout_prob
@@ -147,7 +148,7 @@ class EventMILModel(nn.Module):
         dom_emb = self.domain_embed(domain_id)
         calib = self.calib_mlp(torch.cat([color_feat, scale_feat, dom_emb], dim=1))
 
-        out = self.head(torch.cat([pooled, calib], dim=1))
+        out = self.head(torch.cat([attn_pooled, calib], dim=1))
         return out
 
 
@@ -204,7 +205,7 @@ class Model:
         self.target_std = torch.ones(3, dtype=torch.float32)
         self.image_size = 224
         self.calib_size = 128
-        self.checkpoint_path = checkpoint_path or os.path.join(os.path.dirname(__file__), "model.pth")
+        self.checkpoint_path = checkpoint_path or os.path.join(os.path.dirname(__file__), "model_v2.pth")
 
     def load(self):
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
@@ -231,7 +232,7 @@ class Model:
         else:
             num_domains = state_dict["domain_embed.weight"].shape[0]
 
-        self.model = EventMILModel(num_species=num_species, num_domains=num_domains)
+        self.model = EventMILModelV2(num_species=num_species, num_domains=num_domains)
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device)
         self.model.eval()
@@ -293,7 +294,8 @@ class Model:
             )
             mu = out[:, :3]
             log_sigma = out[:, 3:]
-            sigma = F.softplus(log_sigma).clamp_min(1e-3)
+            log_sigma = log_sigma.clamp(-6.0, 3.0)
+            sigma = F.softplus(log_sigma) + 1e-3
 
         mu = mu * self.target_std.to(self.device) + self.target_mean.to(self.device)
         sigma = sigma * self.target_std.to(self.device)
