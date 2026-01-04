@@ -1,0 +1,167 @@
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+from datasets import load_dataset
+
+from utils import (
+    get_training_args,
+    get_DINO,
+    extract_dino_features,
+    evalute_spei_r2_scores,
+    get_collate_fn,
+)
+from model import DINO_DeepRegressor
+
+
+def train(model, dataloader, val_dataloader, lr, epochs, save_dir):
+    optimizer = optim.Adam(model.regressor.parameters(), lr)
+    loss_fn = nn.MSELoss()
+    best_r2 = -1.0
+    best_epoch = 0
+    save_path = Path(save_dir, "model.pth")
+    print("begin training")
+    tbar = tqdm(range(epochs), position=0, leave=True)
+    for epoch in tbar:
+        model.train()
+        epoch_loss = 0
+        inner_tbar = tqdm(dataloader, "training model", position=1, leave=False)
+        preds = []
+        gts = []
+        for feats, y in inner_tbar:
+            y = y.cuda()
+            optimizer.zero_grad()
+            flatten_feats = model.tokens_to_linear(feats.cuda()).squeeze()
+            outputs = model.regressor(flatten_feats)
+            loss = loss_fn(y, outputs)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss = epoch_loss + loss
+            preds.extend(outputs.detach().cpu().numpy().tolist())
+            gts.extend(y.detach().cpu().numpy().tolist())
+            inner_tbar.set_postfix({"loss": loss.item()})
+
+        gts = np.array(gts)
+        preds = np.array(preds)
+        spei_30_r2, spei_1y_r2, spei_2y_r2 = evalute_spei_r2_scores(gts, preds)
+        log_dict = {
+            "train_loss": epoch_loss.item() / len(dataloader),
+            "epoch": epoch,
+            "train_SPEI_30d_r2": spei_30_r2,
+            "train_SPEI_1y_r2": spei_1y_r2,
+            "train_SPEI_2y_r2": spei_2y_r2,
+        }
+        tbar.set_postfix(log_dict)
+
+        epoch_loss = 0
+        inner_tbar = tqdm(val_dataloader, "validating model", position=1, leave=False)
+        preds = []
+        gts = []
+        model.eval()
+        with torch.no_grad():
+            for feats, y in inner_tbar:
+                y = y.cuda()
+                flatten_feats = model.tokens_to_linear(feats.cuda()).squeeze()
+                outputs = model.regressor(flatten_feats)
+                loss = loss_fn(y, outputs)
+
+                epoch_loss = epoch_loss + loss
+                preds.extend(outputs.detach().cpu().numpy().tolist())
+                gts.extend(y.detach().cpu().numpy().tolist())
+                inner_tbar.set_postfix({"loss": loss.item()})
+
+        gts = np.array(gts)
+        preds = np.array(preds)
+        spei_30_r2, spei_1y_r2, spei_2y_r2 = evalute_spei_r2_scores(gts, preds)
+        log_dict |= {
+            "val_loss": epoch_loss.item() / len(dataloader),
+            "val_SPEI_30d_r2": spei_30_r2,
+            "val_SPEI_1y_r2": spei_1y_r2,
+            "val_SPEI_2y_r2": spei_2y_r2,
+        }
+
+        avg_val_r2 = sum([spei_30_r2, spei_1y_r2, spei_2y_r2]) / 3.0
+        if avg_val_r2 >= best_r2:
+            best_r2 = avg_val_r2
+            best_epoch = epoch
+
+            torch.save(model.regressor.state_dict(), save_path)
+
+        log_dict |= {
+            "best_epoch": best_epoch,
+            "best_val_r2": best_r2,
+        }
+        tbar.set_postfix(log_dict)
+
+    model.regressor.load_state_dict(torch.load(save_path))
+    print("DONE!")
+
+
+def main():
+    # Get training arguments
+    args = get_training_args()
+
+    # Get datasets
+    ds = load_dataset(
+        "imageomics/sentinel-beetles",
+        token=args.hf_token,
+    )
+
+    # load dino and model
+
+    dino, processor = get_DINO()
+    model = DINO_DeepRegressor(dino).cuda()
+
+    # Transform images for model input
+    def dset_transforms(examples):
+        examples["pixel_values"] = [
+            processor(img.convert("RGB"), return_tensors="pt")["pixel_values"][0]
+            for img in examples["file_path"]
+        ]
+        return examples
+
+    train_dset = ds["train"].with_transform(dset_transforms)
+    val_dset = ds["validation"].with_transform(dset_transforms)
+
+    dataloaders = []
+    for i, dset in enumerate([train_dset, val_dset]):
+        dataloader = DataLoader(
+            dataset=dset,
+            batch_size=args.batch_size,
+            shuffle=i == 0,  # Shuffle only for training set
+            num_workers=args.num_workers,
+            collate_fn=get_collate_fn(),
+        )
+
+        # Extract features
+        X, Y = extract_dino_features(dataloader, dino)
+
+        dataloader = DataLoader(
+            dataset=torch.utils.data.TensorDataset(X, Y),
+            batch_size=args.batch_size,
+            shuffle=i == 0,  # Shuffle only for training set
+            num_workers=args.num_workers,
+        )
+        dataloaders.append(dataloader)
+
+    train_dataloader, val_dataloader = dataloaders
+
+    # run model
+    save_dir = Path(__file__).resolve().parent
+    train(
+        model=model,
+        dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        lr=args.lr,
+        epochs=args.epochs,
+        save_dir=save_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

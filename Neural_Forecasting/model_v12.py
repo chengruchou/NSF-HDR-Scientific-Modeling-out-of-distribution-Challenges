@@ -1,7 +1,8 @@
 """
-this is model_v10.py
+this is model_v12.py
 """
 import os
+import glob
 from contextlib import nullcontext
 
 import numpy as np
@@ -29,9 +30,9 @@ class Time2Vec(nn.Module):
         return torch.cat([lin.unsqueeze(-1), per], dim=-1)
 
 
-class NFSTNDTModelV10(nn.Module):
+class NFSTNDTModelV12(nn.Module):
     """
-    v10: change-aware, multi-head forecasting model.
+    v9: change-aware, multi-head forecasting model.
     - Input: x (B, T, F), optional t (B, T)
     - Adds change-aware features (dx, ddx) before the encoder to improve spike sensitivity.
     - Two heads share the same encoder representation:
@@ -184,12 +185,14 @@ class Model:
 
         if self.monkey_name == "beignet":
             self.input_size = 89
-            self.weight_file = "model_beignet_v10.pth"
-            self.stats_file = "train_data_average_std_beignet_v10.npz"
+            self.weight_file = "model_beignet_v12.pth"
+            self.weight_glob = "model_beignet_v12_seed*.pth"
+            self.stats_file = "train_data_average_std_beignet.npz"
         elif self.monkey_name == "affi":
             self.input_size = 239
-            self.weight_file = "model_affi_v10.pth"
-            self.stats_file = "train_data_average_std_affi_v10.npz"
+            self.weight_file = "model_affi_v12.pth"
+            self.weight_glob = "model_affi_v12_seed*.pth"
+            self.stats_file = "train_data_average_std_affi.npz"
         else:
             raise ValueError(f"No such a monkey: {self.monkey_name}")
 
@@ -207,20 +210,12 @@ class Model:
             self.std = None
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = NFSTNDTModelV10(
-            input_size=9,
-            hidden_size=self.hidden_size,
-            n_heads=self.n_heads,
-            n_layers=self.n_layers,
-            dropout=self.dropout,
-            num_features=9,
-            quantiles=self.quantiles,
-        ).to(self.device)
+        self.models = []
 
         self._is_loaded = False
         self._denorm_params = None
 
-    def _load_state_dict(self, state):
+    def _load_state_dict(self, model, state):
         # Accept plain state_dict or common checkpoint wrappers.
         if isinstance(state, dict):
             if "state_dict" in state:
@@ -231,24 +226,41 @@ class Model:
         print("Loaded keys:", keys[:20])
         assert not any(k.startswith("base_model.") for k in keys), "Checkpoint has base_model.* prefix; save base_model.state_dict() instead"
         assert not any(k.startswith("head.") for k in keys), "Checkpoint has head.*; save base_model.state_dict() instead"
-        self.model.load_state_dict(state, strict=True)
+        model.load_state_dict(state, strict=True)
 
     def load(self):
         base = os.path.dirname(__file__)
-        path = os.path.join(base, self.weight_file)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Expected weight file at {path}")
+        ckpt_paths = sorted(glob.glob(os.path.join(base, self.weight_glob)))
+        if not ckpt_paths:
+            path = os.path.join(base, self.weight_file)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Expected weight file at {path}")
+            ckpt_paths = [path]
 
-        # weights_only is used when available (PyTorch>=2.0); falls back otherwise.
-        try:
-            state = torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:
-            state = torch.load(path, map_location="cpu")
+        self.models = []
+        for ckpt in ckpt_paths:
+            model = NFSTNDTModelV12(
+                input_size=9,
+                hidden_size=self.hidden_size,
+                n_heads=self.n_heads,
+                n_layers=self.n_layers,
+                dropout=self.dropout,
+                num_features=9,
+                quantiles=self.quantiles,
+            ).to(self.device)
 
-        self._load_state_dict(state)
-        # self._load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), path), weights_only=True))
-        self.model.to(self.device)
-        self.model.eval()
+            # weights_only is used when available (PyTorch>=2.0); falls back otherwise.
+            try:
+                state = torch.load(ckpt, map_location="cpu", weights_only=True)
+            except TypeError:
+                state = torch.load(ckpt, map_location="cpu")
+
+            self._load_state_dict(model, state)
+            model.to(self.device)
+            model.eval()
+            self.models.append(model)
+
+        print(f"Loaded {len(self.models)} v12 checkpoint(s) for ensemble inference.")
 
         self._is_loaded = True
 
@@ -293,30 +305,12 @@ class Model:
         t = torch.arange(x.shape[1], device=x.device, dtype=x.dtype)
         return t.unsqueeze(0).repeat(x.shape[0], 1)
 
-    def _instance_norm_feature0(self, xb_norm: torch.Tensor, init_steps: int = 10):
-        # xb_norm: (B, 20, C, 9) globally normalized to [-1, 1]
-        if xb_norm.ndim != 4:
-            raise ValueError(f"Expected xb_norm with 4 dims. Got {xb_norm.shape}")
-        if xb_norm.shape[1] != 20:
-            raise ValueError(f"Expected T=20. Got {xb_norm.shape[1]}")
-        if xb_norm.shape[3] != 9:
-            raise ValueError(f"Expected F=9. Got {xb_norm.shape[3]}")
-        if init_steps <= 0 or init_steps > xb_norm.shape[1]:
-            raise ValueError(f"Invalid init_steps={init_steps} for T={xb_norm.shape[1]}")
-
-        x0 = xb_norm[:, :init_steps, :, 0]
-        mu = x0.mean(dim=1, keepdim=True)
-        sigma = x0.std(dim=1, keepdim=True, unbiased=False) + 1e-6
-        x0_hat = (xb_norm[:, :, :, 0] - mu) / sigma
-        xb_norm[:, :, :, 0] = x0_hat
-        return xb_norm, mu, sigma
-
-    def _forward_v9(self, x, t):
+    def _forward_v9(self, model, x, t):
         # x: (B, T, C, F) -> run v9 on (B*C, T, F)
         B, T, C, F = x.shape
         x_flat = x.permute(0, 2, 1, 3).contiguous().view(B * C, T, F)
         t_flat = t.unsqueeze(1).repeat(1, C, 1).view(B * C, T)
-        out = self.model(x_flat, t_flat)
+        out = model(x_flat, t_flat)
         y_pred = out["y_pred"]
         if y_pred.dim() == 2:
             y_pred = y_pred.unsqueeze(-1)
@@ -367,24 +361,23 @@ class Model:
             xb = torch.from_numpy(x[start:end]).to(self.device)  # (B,20,C,9)
 
             xb = self._normalize_torch(xb)
-            f0_base = xb[:, :, :, 0].clone()
             xb[:, init_steps:, :, :] = xb[:, init_steps - 1:init_steps, :, :]
-            xb, mu, sigma = self._instance_norm_feature0(xb, init_steps=init_steps)
 
             t_in = self._build_time_tensor(xb)
             with autocast_ctx:
-                yb_q = self._forward_v9(xb, t_in)  # (B,20,C,Q)
-
-            if yb_q.shape[-1] > 1:
-                median_idx = self.quantiles.index(0.5)
-                yb = yb_q[..., median_idx]
-            else:
-                yb = yb_q.squeeze(-1)
-
-            yb = yb * sigma.squeeze(1) + mu.squeeze(1)
+                preds = []
+                for model in self.models:
+                    yb_q = self._forward_v9(model, xb, t_in)  # (B,20,C,Q)
+                    if yb_q.shape[-1] > 1:
+                        median_idx = self.quantiles.index(0.5)
+                        yb = yb_q[..., median_idx]
+                    else:
+                        yb = yb_q.squeeze(-1)
+                    preds.append(yb)
+                yb = torch.stack(preds, dim=0).mean(dim=0)
 
             # enforce competition output definition: first 10 steps are given
-            yb[:, :init_steps, :] = f0_base[:, :init_steps, :]
+            yb[:, :init_steps, :] = xb[:, :init_steps, :, 0]
             yb = self._denorm_feature0_torch(yb)
             outputs.append(yb.detach().cpu())
 
