@@ -19,7 +19,7 @@ def get_training_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--domain_id_aug_prob", type=float, default=0.1)
-    parser.add_argument("--checkpoint_name", type=str, default="model_v2.pth")
+    parser.add_argument("--checkpoint_name", type=str, default="model_v5.pth")
     parser.add_argument("--freeze_backbone", type=int, default=3)
     parser.add_argument("--amp", type=int, default=1)
     parser.add_argument("--max_instances", type=int, default=12)
@@ -27,32 +27,100 @@ def get_training_args():
     parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--calib_size", type=int, default=128)
-    parser.add_argument("--model_version", type=str, choices=["v1", "v2"], default="v2")
+    parser.add_argument("--model_version", type=str, choices=["v1", "v2", "v3", "v4", "v5"], default="v5")
     parser.add_argument("--sanity_check", action="store_true")
     return parser.parse_args()
 
 
-def build_transforms(image_size: int = 224, calib_size: int = 128):
-    img_transform = transforms.Compose(
-        [
+def build_transforms(
+    image_size: int = 224,
+    calib_size: int = 128,
+    train: bool = False,
+    model_version: Optional[str] = None,
+):
+    if model_version == "v5":
+        img_transforms = [
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
-    )
-    calib_transform = transforms.Compose(
-        [
-            transforms.Resize(calib_size),
-            transforms.CenterCrop(calib_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+        if train:
+            img_transforms.append(transforms.RandomHorizontalFlip(p=0.5))
+        img_transforms.extend(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        img_transform = transforms.Compose(img_transforms)
+        calib_transform = transforms.Compose(
+            [
+                transforms.Resize(calib_size),
+                transforms.CenterCrop(calib_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    elif train:
+        img_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+                transforms.RandomApply(
+                    [transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)],
+                    p=0.5,
+                ),
+                transforms.RandomGrayscale(p=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        calib_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(calib_size, scale=(0.8, 1.0)),
+                transforms.RandomApply(
+                    [transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)],
+                    p=0.5,
+                ),
+                transforms.RandomGrayscale(p=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    else:
+        img_transform = transforms.Compose(
+            [
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        calib_transform = transforms.Compose(
+            [
+                transforms.Resize(calib_size),
+                transforms.CenterCrop(calib_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
     return img_transform, calib_transform
 
 
 def gaussian_crps(y_true, mu, sigma):
+    if torch.is_tensor(y_true) or torch.is_tensor(mu) or torch.is_tensor(sigma):
+        if not torch.is_tensor(y_true):
+            y_true = torch.tensor(y_true, device=mu.device if torch.is_tensor(mu) else sigma.device)
+        if not torch.is_tensor(mu):
+            mu = torch.tensor(mu, device=y_true.device)
+        if not torch.is_tensor(sigma):
+            sigma = torch.tensor(sigma, device=y_true.device)
+        sigma = torch.clamp(sigma, min=1e-3)
+        z = (y_true - mu) / sigma
+        sqrt_2 = math.sqrt(2.0)
+        phi = torch.exp(-0.5 * z ** 2) / math.sqrt(2.0 * math.pi)
+        Phi = 0.5 * (1.0 + torch.erf(z / sqrt_2))
+        crps = sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+        return crps
+
     sigma = np.maximum(sigma, 1e-3)
     z = (y_true - mu) / sigma
     sqrt_2 = np.sqrt(2.0)
@@ -135,6 +203,9 @@ class EventDataset(Dataset):
         if hasattr(calib_transform, "transforms"):
             for t in calib_transform.transforms:
                 if isinstance(t, transforms.CenterCrop):
+                    self._calib_size = t.size
+                    break
+                if isinstance(t, transforms.RandomResizedCrop):
                     self._calib_size = t.size
                     break
         if isinstance(self._calib_size, (list, tuple)):
