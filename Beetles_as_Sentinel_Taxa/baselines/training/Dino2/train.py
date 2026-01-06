@@ -18,6 +18,18 @@ from utils import (
 from model import DINO_DeepRegressor
 
 
+class DsetTransforms:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, examples):
+        examples["pixel_values"] = [
+            self.processor(img.convert("RGB"), return_tensors="pt")["pixel_values"][0]
+            for img in examples["file_path"]
+        ]
+        return examples
+
+
 def train(model, dataloader, val_dataloader, lr, epochs, save_dir):
     optimizer = optim.Adam(model.regressor.parameters(), lr)
     loss_fn = nn.MSELoss()
@@ -109,7 +121,7 @@ def main():
     # Get datasets
     ds = load_dataset(
         "imageomics/sentinel-beetles",
-        token=args.hf_token,
+        # token=args.hf_token,
     )
 
     # load dino and model
@@ -118,13 +130,7 @@ def main():
     model = DINO_DeepRegressor(dino).cuda()
 
     # Transform images for model input
-    def dset_transforms(examples):
-        examples["pixel_values"] = [
-            processor(img.convert("RGB"), return_tensors="pt")["pixel_values"][0]
-            for img in examples["file_path"]
-        ]
-        return examples
-
+    dset_transforms = DsetTransforms(processor)
     train_dset = ds["train"].with_transform(dset_transforms)
     val_dset = ds["validation"].with_transform(dset_transforms)
 
@@ -145,7 +151,7 @@ def main():
             dataset=torch.utils.data.TensorDataset(X, Y),
             batch_size=args.batch_size,
             shuffle=i == 0,  # Shuffle only for training set
-            num_workers=args.num_workers,
+            num_workers=0,
         )
         dataloaders.append(dataloader)
 

@@ -10,20 +10,30 @@ from sklearn.metrics import r2_score
 from open_clip import create_model_and_transforms
 
 
-def get_collate_fn(other_columns=None):
-    def collate_fn(batch):
+class CollateFn:
+    def __init__(self, other_columns=None):
+        self.other_columns = other_columns
+
+    def __call__(self, batch):
         pixel_values = torch.stack([example["pixel_values"] for example in batch])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        spei_values = torch.stack([torch.tensor([example["SPEI_30d"], example["SPEI_1y"], example["SPEI_2y"]]) for example in batch])
+        spei_values = torch.stack(
+            [
+                torch.tensor([example["SPEI_30d"], example["SPEI_1y"], example["SPEI_2y"]])
+                for example in batch
+            ]
+        )
         rv = [pixel_values, spei_values]
-        
-        if other_columns:
-            for col in other_columns:
+
+        if self.other_columns:
+            for col in self.other_columns:
                 rv.append([example[col] for example in batch])
-        
+
         return rv
-    
-    return collate_fn
+
+
+def get_collate_fn(other_columns=None):
+    return CollateFn(other_columns=other_columns)
 
 def get_str_date():
     today = date.today()
@@ -164,7 +174,7 @@ def get_DINO():
     """
     model = AutoModel.from_pretrained("facebook/dinov2-base")
     model = model.cuda()
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base", use_fast=True)
     return model, processor
 
 
@@ -172,7 +182,7 @@ def get_training_args():
     parser = ArgumentParser()
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--n_last_trainable_blocks", type=int, default=2)
     parser.add_argument("--domain_id_aug_prob", type=float, default=0.2)
