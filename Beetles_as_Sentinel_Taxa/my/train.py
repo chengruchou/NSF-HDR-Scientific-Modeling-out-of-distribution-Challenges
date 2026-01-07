@@ -30,6 +30,7 @@ from model_v2 import EventMILModelV2, Model as InferenceModelV2
 from model_v3 import EventMILModelV3
 from model_v4 import EventMILModelV4, Model as InferenceModelV4
 from model_v5 import EventMILModelV5, Model as InferenceModelV5
+from model_v6 import EventMILModelV6, Model as InferenceModelV6
 
 
 def _gaussian_nll(mu, sigma, target):
@@ -137,6 +138,16 @@ def train(
                 )
                 optimizer.param_groups[1]["lr"] = 1e-5
                 print("Unfreeze all backbone layers at epoch 4")
+                print(f"Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
+
+        elif model_version == "v6":
+            if epoch_num == 4 and not _backbone_layer_trainable(model, "stages.3"):
+                convnext_layers = ["stem", "stages.0", "stages.1", "stages.2", "stages.3"]
+
+                _set_backbone_requires_grad(model, convnext_layers, True)
+
+                optimizer.param_groups[1]["lr"] = 1e-5
+                print("Unfreeze all ConvNeXt backbone layers at epoch 4")
                 print(f"Backbone LR: {optimizer.param_groups[1]['lr']:.6f}")
         else:
             if epoch_num == 10 and not _backbone_layer_trainable(model, "layer3"):
@@ -314,8 +325,8 @@ def main():
         quick_sanity_check()
         return
     save_dir = Path(__file__).resolve().parent
-    if args.model_version == "v5" and args.checkpoint_name == "model_v4.pth":
-        args.checkpoint_name = "model_v5.pth"
+    if args.model_version == "v6" and args.checkpoint_name == "model_v6.pth":
+        args.checkpoint_name = "model_v6.pth"
     save_path = save_dir / args.checkpoint_name
     print(f"Model will be saved to: {save_path}")
     print("Loading Dataset...")
@@ -404,6 +415,8 @@ def main():
         model = EventMILModelV4(num_species=len(species_map), num_domains=len(domain_map))
     elif args.model_version == "v5":
         model = EventMILModelV5(num_species=len(species_map), num_domains=len(domain_map))
+    elif args.model_version == "v6":
+        model = EventMILModelV6(num_species=len(species_map), num_domains=len(domain_map))
     else:
         model = EventMILModel(num_species=len(species_map), num_domains=len(domain_map))
     model.species_to_idx = species_map
@@ -411,7 +424,7 @@ def main():
     if args.model_version == "v1" and args.freeze_backbone:
         model.freeze_backbone_stages(args.freeze_backbone)
         print(f"Backbone frozen until layer{args.freeze_backbone} (only upper layers + head trainable)")
-    if args.model_version in ("v2", "v3", "v4", "v5"):
+    if args.model_version in ("v2", "v3", "v4", "v5", "v6"):
         _set_backbone_requires_grad(
             model, ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"], False
         )
@@ -450,8 +463,8 @@ def quick_sanity_check():
     import model_v5  # noqa: F401
     import train  # noqa: F401
 
-    checkpoint = Path(__file__).resolve().parent / "model_v5.pth"
-    model = InferenceModelV5(checkpoint_path=str(checkpoint))
+    checkpoint = Path(__file__).resolve().parent / "model_v6.pth"
+    model = InferenceModelV6(checkpoint_path=str(checkpoint))
     if checkpoint.exists():
         model.load()
         print("Loaded checkpoint for sanity check.")

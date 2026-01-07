@@ -19,7 +19,7 @@ def get_training_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--domain_id_aug_prob", type=float, default=0.1)
-    parser.add_argument("--checkpoint_name", type=str, default="model_v5.pth")
+    parser.add_argument("--checkpoint_name", type=str, default="model_v6.pth")
     parser.add_argument("--freeze_backbone", type=int, default=3)
     parser.add_argument("--amp", type=int, default=1)
     parser.add_argument("--max_instances", type=int, default=12)
@@ -27,7 +27,7 @@ def get_training_args():
     parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--calib_size", type=int, default=128)
-    parser.add_argument("--model_version", type=str, choices=["v1", "v2", "v3", "v4", "v5"], default="v5")
+    parser.add_argument("--model_version", type=str, choices=["v1", "v2", "v3", "v4", "v5", "v6"], default="v6")
     parser.add_argument("--sanity_check", action="store_true")
     return parser.parse_args()
 
@@ -38,7 +38,7 @@ def build_transforms(
     train: bool = False,
     model_version: Optional[str] = None,
 ):
-    if model_version == "v5":
+    if model_version == "v5" or model_version == "v6":
         img_transforms = [
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
