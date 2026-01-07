@@ -425,13 +425,19 @@ def main():
         model.freeze_backbone_stages(args.freeze_backbone)
         print(f"Backbone frozen until layer{args.freeze_backbone} (only upper layers + head trainable)")
     if args.model_version in ("v2", "v3", "v4", "v5", "v6"):
-        _set_backbone_requires_grad(
-            model, ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"], False
-        )
+        if args.model_version == "v6":
+            # ConvNeXt uses 'stem' and 'stages'
+            _set_backbone_requires_grad(
+                model, ["stem", "stages.0", "stages.1", "stages.2", "stages.3"], False
+            )
+            print("ConvNeXt Backbone (v6) frozen for first 3 epochs")
+        else:
+            _set_backbone_requires_grad(
+                model, ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"], False
+            )
         if args.model_version == "v4":
             print("Backbone frozen for first 2 epochs")
-        else:
-            print("Backbone frozen for first 3 epochs")
+
     model = model.to(device)
     amp_enabled = bool(args.amp and device.type == "cuda")
 
