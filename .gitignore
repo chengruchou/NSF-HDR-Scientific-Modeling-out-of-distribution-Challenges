@@ -213,3 +213,7 @@ __marimo__/
 *.mat
 STNDT-main/
 HDRChallenge_y2-main/
+
+# uv
+pyproject.toml
+.python-version
