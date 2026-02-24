@@ -215,5 +215,5 @@ STNDT-main/
 HDRChallenge_y2-main/
 
 # uv
-pyproject.toml
+# pyproject.toml
 .python-version

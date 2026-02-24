@@ -43,7 +43,7 @@ def _gaussian_crps(mu, sigma, target):
 
 
 def _extract_mu_sigma(outputs, model_version):
-    if model_version in ("v3", "v4", "v5"):
+    if model_version in ("v3", "v4", "v5", "v6"):
         mu = outputs["mu"]
         sigma = outputs["sigma"]
         return mu, sigma
