@@ -22,7 +22,7 @@ This repository contains the main inference script, model/training pipeline, and
 - **`evaluation.py`**: Local evaluation/smoke-test script for model loading, output format verification, and validation metrics on sampled events.
 - **`requirements.txt`**: Python package dependencies.
 
-## ⚙️ Key Technical Approaches
+## Key Technical Approaches
 
 ### 1. Event-Level Multiple Instance Learning
 Each event is modeled as a bag of beetle images; attention pooling aggregates instance-level features into an event representation for SPEI prediction.
@@ -36,7 +36,7 @@ The pipeline fuses:
 ### 3. Probabilistic Multi-Horizon Prediction
 The model predicts Gaussian parameters (`mu`, `sigma`) for three horizons, enabling uncertainty-aware inference and CRPS-based evaluation.
 
-## 📦 Dependencies
+## Dependencies
 - `torch`
 - `torchvision`
 - `numpy`
@@ -45,7 +45,7 @@ The model predicts Gaussian parameters (`mu`, `sigma`) for three horizons, enabl
 - `datasets`
 - `scikit-learn`
 
-## 🚀 Usage
+## Usage
 
 Install dependencies:
 
@@ -66,5 +66,4 @@ python evaluation.py
 ```
 
 ## Notes
-- Ensure checkpoint files (for example `model.pth` or `model_v6.pth`) are placed in this folder before inference/evaluation.
-- `train.py` and `evaluation.py` rely on the Hugging Face dataset `imageomics/sentinel-beetles`, so internet access and dataset availability are required.
+- Update dataset paths to your local environment before running experiments.
